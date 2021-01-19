@@ -107,6 +107,7 @@ type KVFilterListFlyWeight<'a> = HashMap<&'a str, &'a HashSet<String>>;
 pub struct KVFilter<D: slog::Drain> {
     drain: D,
     filters: Option<KVFilterList>,
+    key_filters: Option<Vec<String>>,
     neg_filters: Option<KVFilterList>,
     level: slog::Level,
     regex: Option<Regex>,
@@ -124,9 +125,10 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     /// * `level` - maximum level filtered, higher levels pass by without filtering
     pub fn new(drain: D, level: slog::Level) -> Self {
         KVFilter {
-            drain: drain,
-            level: level,
+            drain,
+            level,
             filters: None,
+            key_filters: None,
             neg_filters: None,
             regex: None,
             neg_regex: None,
@@ -137,6 +139,12 @@ impl<'a, D: slog::Drain> KVFilter<D> {
     /// or ignore condition if None
     pub fn only_pass_any_on_all_keys(mut self, filters: Option<KVFilterList>) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// pass through entries with all keys or ignore condition if None
+    pub fn only_pass_on_all_keys(mut self, filters: Option<Vec<String>>) -> Self {
+        self.key_filters = filters;
         self
     }
 
@@ -244,7 +252,7 @@ mod tests {
     use super::KVFilter;
     use slog::{Drain, Level, Logger, OwnedKVList, Record};
     use regex::Regex;
-    use std::collections::HashSet;
+    use std::collections::{HashSet, HashMap};
     use std::iter::FromIterator;
     use std::sync::Mutex;
     use std::fmt::Display;
@@ -256,7 +264,7 @@ mod tests {
     const YES: &'static str = "YES";
     const NO: &'static str = "NO";
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct StringDrain {
         output: Arc<Mutex<Vec<String>>>,
     }
@@ -317,6 +325,72 @@ mod tests {
             ].into_iter()
                 .collect(),
         ))
+    }
+
+    #[test]
+    fn should_filter_only_values_with_matching_keys() {
+        let out = Arc::new(Mutex::new(vec![]));
+        let drain = StringDrain {
+            output: out.clone(),
+        };
+        // Filter out messages that do not have error key
+        let filters = Some(vec!["err".to_string()]);
+
+        // Build filter which only checks key existence
+        let filter = KVFilter::new(drain.clone(), Level::Warning)
+            .only_pass_on_all_keys(filters.clone());
+
+        let main_log = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+        info!(main_log, "NO: filtered, main, no keys");
+
+        let missing_error_log = main_log.new(o!("data" => "{ \"users\": [] }"));
+        info!(missing_error_log, "NO: filtered, missing, no filtered keys");
+
+        let empty_error_log = main_log.new(o!("err" => ""));
+        info!(empty_error_log, "YES: actual but empty value");
+
+        let none_error_log = main_log.new(o!("err" => "None"));
+        info!(none_error_log, "YES: actual but None value");
+
+        let real_error_log = main_log.new(o!("err" => "internal server error"));
+        info!(real_error_log, "YES: actual value");
+
+
+        // Build filter to check if matched keys have bad values, and filter if so
+        let filter = KVFilter::new(drain, Level::Warning)
+
+            .only_pass_any_on_all_keys(Some(
+                {
+                    let mut h = HashMap::new();
+                    h.insert("err".to_string(), HashSet::new());
+                    h
+                }
+            ))            .always_suppress_any(Some(
+                vec![(
+                    "err".to_string(),
+                    HashSet::from_iter(vec!["None".to_string(), "".to_string()]),
+                )]
+                    .into_iter()
+                    .collect(),
+            ))
+            ;
+
+        let main_log = Logger::root(filter.fuse(), o!("version" => env!("CARGO_PKG_VERSION")));
+        info!(main_log, "NO: filtered, main, no keys");
+
+        let missing_error_log = main_log.new(o!("data" => "{ \"users\": [] }"));
+        info!(missing_error_log, "NO: filtered, missing, no filtered keys");
+
+        let empty_error_log = main_log.new(o!("err" => ""));
+        info!(empty_error_log, "NO: empty error value");
+
+        let none_error_log = main_log.new(o!("err" => "None"));
+        info!(none_error_log, "NO: error value is None, bad value");
+
+        let real_error_log = main_log.new(o!("err" => "internal server error"));
+        info!(real_error_log, "YES: actual value");
+
+        println!("resulting output: {:#?}", *out.lock().unwrap());
     }
 
     #[test]
